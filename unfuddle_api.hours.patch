@@ -1,0 +1,11 @@
+--- unfuddle_api.classes.inc	2011-04-18 01:38:08.000000000 -0700
++++ unfuddle_api.classes.new.inc	2012-03-19 11:27:53.000000000 -0700
+@@ -318,6 +318,8 @@ class Unfuddle {
+     "  <priority>" . (isset($fields['priority']) ? $fields['priority'] : 3)  . "</priority>\n".
+     "  <project-id>" . $projectID . "</project-id>\n".
+     "  <status>new</status>\n".
++    "  <hours-estimate-current>" . $fields['hours-estimate-current'] . "</hours-estimate-current>\n".
++    "  <hours-estimate-initial>" . $fields['hours-estimate-initial'] . "</hours-estimate-initial>\n".
+     "  </ticket>\n";
+     // @TODO handle other fields (http://unfuddle.com/docs/api/data_models), maybe create a SimpleXML object?
+     

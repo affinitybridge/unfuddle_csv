@@ -1,0 +1,285 @@
+<?php
+
+/**
+ * @file
+ * Download and parse CSV, push it into Unfuddle as new tickets
+ */
+
+/**
+ * Implementation of hook_menu().
+ */
+function unfuddle_csv_menu() {
+  $items = array();
+
+  $items['admin/unfuddle_csv'] = array(
+    'title' => 'Unfuddle CSV Ticket Import',
+    'description' => 'Parse a <abbr title="Comma Separated Values">CSV</abbr> file and push into Unfuddle as tickets.',
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('unfuddle_csv_import_form'),
+  );
+
+  $items['admin/unfuddle_csv/viewfile'] = array(
+    'title' => 'Inspecting a CSV file',
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+    'page callback' => 'unfuddle_csv_view_file',
+    'page arguments' => array(3),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/unfuddle_csv/delete'] = array(
+    'title' => 'Deleting a CSV file',
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+    'page callback' => 'unfuddle_csv_delete_file',
+    'page arguments' => array(3),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/unfuddle_csv/process'] = array(
+    'title' => 'Totally make unfuddle tickets',
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+    'page callback' => 'unfuddle_csv_process_file',
+    'page arguments' => array(3),
+    'type' => MENU_CALLBACK,
+  );
+  
+  return $items;
+}
+
+/**
+ * Admin form - lets you upload a CSV file.
+ */
+function unfuddle_csv_import_form(&$form_state) {
+  $form = array();
+  
+  // Show a list of CSV files uploaded so far, if any.
+  // TO DO: provide a "Delete" link for each file.
+  $files = unfuddle_csv_list_files();
+  if ($files) {
+    $header = array(t('FID'), t('Filename'), t('Uploaded on'), t('Type'), t('Path'), '', '');
+    $rows = array();
+    foreach ($files as $k => $file) {
+      $rows[] = array(
+        $file->fid,
+        $file->filename,
+        $file->timestamp,
+        $file->filemime,
+        $file->filepath,
+        l('View', 'admin/unfuddle_csv/viewfile/'.$file->fid),
+        l('Delete', 'admin/unfuddle_csv/delete/'.$file->fid),
+      );
+    }
+    $files_table = theme('table', $header, $rows);
+    
+    $form['files'] = array(
+      '#value' => $files_table,
+      '#description' => t('Here is a list of CSV files that have been uploaded to this
+      Drupal site.  To try to manufacture Unfuddle tickets from any one of these,
+      click "View".'),
+    );
+  }
+
+  // Provide the upload field.
+
+  $form['#attributes'] = array('enctype' => 'multipart/form-data'); // TO DO: check if this line is necessary.
+
+  $form['upload'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Upload a CSV file'),
+    '#description' => t('<strong>The file you are uploading must be in UTF8 encoding.</strong>  (I think.)'), // TO DO: check.
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+  );
+  $form['upload']['file_upload'] = array(
+    '#type' => 'file',
+  );
+  $form['upload']['file_upload_button'] = array(
+    '#type' => 'submit',
+    '#value' => t('Upload file'),
+    '#submit' => array('unfuddle_csv_import_form_submit_upload_file'),
+  );
+
+  return $form;  
+}
+
+/**
+ * Submit function for the CSV-upload admin page; saves the CSV file.
+ */
+function unfuddle_csv_import_form_submit_upload_file($form, &$form_state) {
+
+  // Use the default file directory.
+  $dest = file_directory_path();
+
+  if (($file = file_save_upload('file_upload', array(), $dest, FILE_EXISTS_RENAME))) {
+    drupal_set_message(t('New file %name uploaded to %path.', array('%name' => $file->filename, 
+      '%path' => $file->filepath)));
+    file_set_status($file, FILE_STATUS_PERMANENT);
+    $form_state['values']['fid'] = $file->fid;
+  }
+}
+
+/**
+ * Returns a list of all CSV files that have been uploaded.
+ */
+function unfuddle_csv_list_files() {
+  // Get info from the DB on all text/CSV files in the files table.
+  $result = db_query("SELECT * FROM {files} WHERE filemime = 'text/csv' AND status = " . 
+    FILE_STATUS_PERMANENT . " ORDER BY timestamp");
+  
+  // Create the list, keep only the still-existing files.
+  while (($file = db_fetch_object($result))) {
+    if (!file_exists(file_create_path($file->filepath))) {
+      drupal_set_message(t('The previously uploaded file %name is no longer present. Removing it 
+        from the list of uploaded files.', array('%name' => $file->filepath)));
+      file_set_status($file, FILE_STATUS_TEMPORARY);
+    }
+    else {
+      $files[$file->fid] = $file;
+    }
+  }
+
+  return $files;
+}
+
+/**
+ * Displays the contents of a CSV file as a table, for a pre-import onscreen sanity check.
+ */ 
+function unfuddle_csv_view_file($fid) {
+  
+  $output = '';
+  
+  // Provide some help text.
+  $output .= t('To get successfully magicked into Unfuddle tickets, the CSV file needs to have
+    a header row, and it needs to include a <i>summary</i> column. You can optionally include
+    the following columns: <i>description, milestone, assignee, priority, hours</i>.  The 
+    columns can be in any order as long as they have those exact headers.<br /><br />');
+  
+  // Get the data from the CSV file as an aray.
+  $data = unfuddle_csv_parse_file($fid);
+  
+  // Check if the data are usable. Is there a header and data, and a summary column?
+  if (!$data['header'] || !$data['rows'] || !in_array('summary', $data['header'])) {
+    // Provide an explanation of why this is a no go.
+    if (!in_array('summary', $data['header'])) {
+      $output .= t("This CSV file won't work - it doesn't have a summary column.");
+    } else {
+      $output .= t("This CSV file won't work - it doesn't have enough rows.");
+    }
+  } else {
+    // If these data will work, provide a button to unfuddle-ize these data.
+    $output .= l('Data below look good? Then click here and await the magic.', 'admin/unfuddle_csv/process/'.$fid);
+  }
+  
+  // Display the data.
+  $output .= theme('table', $data['header'], $data['rows']);
+  
+  return $output;
+}
+
+/**
+ * Loops through a CSV file, making unfuddle tickets using the Unfuddle API.
+ */ 
+function unfuddle_csv_process_file($fid) {
+  
+  $successcount = 0;
+  $failcount = 0;
+  
+  // Get the data from the CSV file as an aray.
+  $data = unfuddle_csv_parse_file($fid);
+  
+  // Loop through the data.
+  foreach ($data['rows'] as $k => $row) {
+    // TO DO: Try to find a way to make this loop less slow or use Batch API.
+    // Can we move the unfuddle_api_create() call out of the loop?
+    
+    $unfuddle = unfuddle_api_create();
+    
+    // Preprocess hours & priority fields
+    $priority = $row['priority'] ? $row['priority'] : 3; // TO DO: Magic numbers are bad!
+    $fields = array(
+      'priority' => $priority,
+      'hours-estimate-initial' => $row['hours'],
+      'hours-estimate-current' => $row['hours'],
+    );
+    
+    // Try to create ticket.
+    if ($result = $unfuddle->createTicket(NULL, $row['summary'], $row['description'], $fields, 
+                      $row['assignee'], $row['milestone'])) {
+      $successcount++;
+    } else {
+      $failcount++;
+    }
+  }
+  
+  // Report degree of success.
+  if ($successcount) {
+    $output = format_plural($successcount,
+      'OK, so we definitely made a ticket there.  Go check Unfuddle.',
+      'OK, so we definitely made @count tickets there.  Go check Unfuddle.',
+      array('@count' => $successcount));
+      
+      if ($failcount) {
+        $output .= '<br /><br />' . format_plural($failcount,
+          'One row from the CSV failed to get ticketized, for some reason.',
+          '@count rows from the CSV failed to get ticketized, for some reason.',
+          array('@count' => $failcount));
+      }
+      
+  } else {
+    $output = 'That did not work. No tickets got created. Programmer, what gives?';
+  }
+  
+  return $output;
+}
+
+/**
+ * Parses the contents of a CSV file.
+ */ 
+function unfuddle_csv_parse_file($fid) {
+
+  // Query up the file details.
+  $result = db_query("SELECT * FROM {files} WHERE fid = " . $fid);
+  $file = db_fetch_object($result);
+  
+  // Parse the CSV, using the guts of parser_csv module.
+  require_once(drupal_get_path('module', 'parser_csv') .'/parser_csv_parser.inc');
+  $it = new ParserCSVIterator($file->filepath);
+  $delimiter = ',';
+  $rawrows = parser_csv_parse($it, $delimiter);
+  
+  // The header row, which we'll return separate from the data rows.
+  $header = array_shift($rawrows);
+  
+  // Empty array to hold the cleaned-up rows data.
+  $rows = array();
+  
+  // Add headers as array keys in the rows data, for ease of processing.
+  foreach ($rawrows as $k => $rawrow) {
+    $newrow = array();
+    foreach ($header as $column_number => $column_label) {
+      $newrow[$column_label] = $rawrow[$column_number];
+    }
+    
+    $rows[] = $newrow;
+    
+  }
+  
+  // Return the header and rows.
+  $return = array('header' => $header, 'rows' => $rows);
+  return $return;
+}
+
+/**
+ * Deletes a CSV file.  TO DO: add a confirmation form.
+ */
+function unfuddle_csv_delete_file($fid) {
+  $path = db_result(db_query("SELECT filepath FROM {files} WHERE fid = %d", $fid));
+  $message = file_delete($path);
+  db_query("DELETE FROM {files} WHERE fid = %d", $fid);
+  drupal_set_message(t('Deleted %filepath from server.', array('%filepath' => $path)));
+  drupal_goto('admin/unfuddle_csv');
+}
